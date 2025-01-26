@@ -53,9 +53,12 @@ float current = 0.;  //lipo battery current
 float prevCurrent = 0;
 float RPM = 0;
 
-#define VIN_PIN 39  //ADC pin for solar panel voltage measurement
-#define CUR_PIN 36
-int zeroCurrent = 0;
+#define VIN_PIN 39  //ADC pin for lipo voltage measurement
+#define CUR_PIN 36  //ADC pin for lipo current measurement
+int zeroCurrent = 0;  //ADC value on the hall sensor when current is null
+#define FILTER_SAMPLES 5000         // 1 = no filtering (faster single acquisition but noise on the hall sensor), 
+#define REJECT_RATIO 40             //points to reject % left and right before averaging (if filter sample >1)
+float smoothArray[FILTER_SAMPLES];  // array for holding raw sensor values for current sensor
 
 //temperature sensor
 #define ONE_WIRE_BUS 13  // Data wire is plugged into pin 13 on the ESP32
@@ -66,7 +69,7 @@ OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature tempScale1(&oneWire);  // Pass our oneWire reference to Dallas Temperature.
 #endif
 
-//scale
+//scale (propeller thrust)
 #define PIN_CLOCK 19  //output to generate clock on Hx711
 #define PIN_DOUT 23   //input Dout from Hx711
 
@@ -76,16 +79,15 @@ int calibWeight = 1000;  //weight at which calibration is done --> expressed in 
 float AverageWeight = 0;
 float CurrentRawWeight = 0;
 
-#define FILTER_SAMPLES 5000         // 1 = no filtering (faster single acquisition but noise), filterSamples should  be an odd number
-#define REJECT_RATIO 40             //points to reject % left and right before averaging (if filter sample >1)
-float smoothArray[FILTER_SAMPLES];  // array for holding raw sensor values for sensor1
+
 
 //speed sensor
 #define TAC_PIN 27  //IR sensor acting as tachometer
-int tops = 0;       //nb tops when anemometer rotates
+int tops = 0;       //nb tops when propeller rotates
 long hallTimeout;   //to debounce
-int speedSensorMeasuringTime;
+int speedSensorMeasuringTime; //to compute RPM
 #define NB_BLADES 2 // 2 tops for a normal 2 blades propeller
+
 
 #define LED_PIN 22
 
@@ -161,7 +163,7 @@ void IRAM_ATTR hall_ISR()  //hall sensor interrupt routine
   {
     hallTimeout = millis();
     tops++;
-    //Serial.println( tops);  //should comment this line to avoid crashes
+    //Serial.println( tops);  //MUST comment this line to avoid crashes
   }
 }
 #endif
@@ -170,9 +172,6 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH);
   Serial.begin(115200);
-
-  //sparks drivers
-
 
   // init Rx channels
   pwm_reader_init(pins, numberOfChannels);
@@ -206,11 +205,12 @@ void setup() {
   //preferences.clear();              // Remove all preferences under the opened namespace
   //preferences.remove("counter");   // remove the counter key only
 
-  calibWeight = preferences.getInt("calibWeight", 1000);
-  calib = preferences.getLong("calib", -222444);  // value for a milk pack ~1000g
+  calibWeight = preferences.getInt("calibWeight", 1000);  //by default calibration of load cell is done with 1kg load attached to the propeller
+  calib = preferences.getLong("calib", -222444);          // value for a milk pack ~1000g (surepeesed when calibration done on the android App)
 
   ssid = preferences.getString("ssid", "");  // Get the ssid  value, if the key does not exist, return a default value of ""
   password = preferences.getString("password", "");
+
 #ifdef PREFERENCES_DEBUG
   Serial.println("_________________");
   Serial.println("read preferences :");
@@ -251,11 +251,11 @@ void setup() {
   //in seconds
   wifiManager.setTimeout(300);
 
-  if (touch3detected)  //then launch WifiManager
+  if (touch3detected)  //then launch WifiManager : touch the Touch3 pin GPIO15 , reset the ESP32 then release the touch pin a Wifi Access point will pop up
   {
     //fetches ssid and pass and tries to connect
     //if it does not connect it starts an access point with the specified name
-    //here  "AutoConnectAP"
+    //here  "JP RCMotorTesterP"
     //and goes into a blocking loop awaiting configuration
     if (!wifiManager.startConfigPortal("JP RCMotorTester")) {
       Serial.println("failed to connect and hit timeout");
@@ -322,7 +322,6 @@ void setup() {
 
 
   //scale init
-  if (ftouchRead(T2) < threshold) touch2detected = true;  //detect touchpad for weight calibration
 #ifdef HAS_HX711
   pinMode(PIN_CLOCK, OUTPUT);  // initialize digital pin 4 as an output.(clock)
   digitalWrite(PIN_CLOCK, HIGH);
@@ -332,14 +331,14 @@ void setup() {
 
   GetRawWeight();
   calibZero = CurrentRawWeight;  // during boot the motor doesn't spin = no thrust on the propeller
-//preferences.putLong("calibZero", calibZero); // no need to store it as computed during each boot and used during loop
+//preferences.putLong("calibZero", calibZero); // no need to store it: computed during each boot and used during loop
 #ifdef DEBUG_W
   Serial.print("calibZero raw value = ");
   Serial.println(calibZero);
 #endif
 #endif  //HAS_HX711
 
-  //anemometer
+  //speed IR sensor
 #ifdef HAS_SPEED_SENSOR
 #ifdef DEBUG
   Serial.println("speed sensor enabled");
@@ -370,7 +369,7 @@ void setup() {
   for (int i = 0; i < FILTER_SAMPLES; i++) {
     smoothArray[i] = analogRead(CUR_PIN);  //ADC smoothing the zeroCurrent delivered by the sensor (should be 2.5V)
   }
-  zeroCurrent = medianFilter();
+  zeroCurrent = medianFilter(); // we will filter the samples to keep the non noisy ones to compute zeroCurrent of the hall sensor
   prevCurrent = 0;
 #ifdef DEBUG_CURRENT
   Serial.print("zero Current ");
@@ -437,7 +436,7 @@ void loop() {
   Serial.print(" / ");
 #endif
   current = amps(current);
-  if ((current) < 0) current = prevCurrent;
+  if ((current) < 0) current = prevCurrent; // this will discard negative current values (spikes due to the ESC...)
   prevCurrent = current;
 #ifdef DEBUG_CURRENT
   Serial.println(current);
@@ -456,12 +455,12 @@ void loop() {
 
 //propeller RPM
 #ifdef HAS_SPEED_SENSOR
-  RPM = tops * 60*1000 / (millis() - speedSensorMeasuringTime)/NB_BLADES;
+  RPM = tops * 60*1000 / (millis() - speedSensorMeasuringTime)/NB_BLADES; // simple formula to go from blades tops to RPM
 #ifdef DEBUG_RPM
   Serial.print("RPM = ");
   Serial.println(RPM);
 #endif
-  tops = 0;
+  tops = 0;                             // reset the ISR variable
   speedSensorMeasuringTime = millis();
 #endif
 
@@ -605,13 +604,7 @@ void readCmd(String test) {
     } else {
       // Fetch values --> {"Cmd":"Start"}
       String Cmd = doc["Cmd"];
-      if (Cmd == "Start")  //start pump
-      {
-#ifdef DEBUG_OUT
-        Serial.print("Start pump ");
-#endif
-
-      } else if (Cmd == "Calib")  //set high
+      if (Cmd == "Calib")  //set high
       {
         String value = doc["value"];
         calibWeight = value.toInt();
@@ -625,7 +618,7 @@ void readCmd(String test) {
 
         preferences.putLong("calib", calib);
         preferences.putInt("calibWeight", calibWeight);
-      } else if (Cmd == "CalibCurrent")  //set high
+      } else if (Cmd == "CalibCurrent")  //not implemented! Calibration done during each boot time in setup
       {
 
         Serial.print("calibration current... ");

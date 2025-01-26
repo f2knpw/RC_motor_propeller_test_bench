@@ -22,3 +22,4 @@ PCB can be purchasaded on PCBWay shared project here : https://www.pcbway.com/pr
 ESP32 firmware is available on this github page : https://github.com/f2knpw/RC_motor_propeller_test_bench/blob/master/ESP32_RC_motor_tester.ino
 
 Android application is available on this github page : https://github.com/f2knpw/RC_motor_propeller_test_bench/blob/master/JP_RCmotorTester.zip
+and here for the .apk file : 

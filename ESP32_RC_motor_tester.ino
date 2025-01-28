@@ -3,7 +3,7 @@
 // #include "esp32-rmt-pwm-reader.h" // if the lib is located directly in the project directory
 
 // init channels and pins
-uint8_t pins[] = { 32, 33 };  // desired input pins
+uint8_t pins[] = { 32 };  // desired input pins
 int numberOfChannels = sizeof(pins) / sizeof(uint8_t);
 
 #include <WiFiClient.h>
@@ -16,6 +16,7 @@ int numberOfChannels = sizeof(pins) / sizeof(uint8_t);
 //1 seconds WDT
 #define WDT_TIMEOUT 1
 int nbTimeout = 0;
+int timeOut = 0;
 int nbAlarm = 0;
 long bootTime;
 
@@ -37,6 +38,21 @@ String displayDebug;
 
 //Radio Rx
 int throttle = -1;
+int opMode = 0;  //0 manual, 1 autoStep, 2 auto sweep, 3 stop
+int minThrottle = 0;
+int maxThrottle = 500;
+float currentThrottle = 0;
+int sweepDuration = 3000;  //5s duration for half an automatic mode
+int refreshDelay;
+float refreshStep;
+long refreshTimeOut = 0;
+
+// ESC output, PWM at 50Hz
+
+#define ESC_PIN 33       // GPIO for ESC output
+#include <ESP32Servo.h>  //https://docs.arduino.cc/libraries/esp32servo/
+Servo myESC;             // create servo object to control an ESC
+
 
 
 //sensors selection
@@ -53,10 +69,11 @@ float current = 0.;  //lipo battery current
 float prevCurrent = 0;
 float RPM = 0;
 
-#define VIN_PIN 39  //ADC pin for lipo voltage measurement
-#define CUR_PIN 36  //ADC pin for lipo current measurement
-int zeroCurrent = 0;  //ADC value on the hall sensor when current is null
-#define FILTER_SAMPLES 5000         // 1 = no filtering (faster single acquisition but noise on the hall sensor), 
+
+#define VIN_PIN 39                  //ADC pin for lipo voltage measurement
+#define CUR_PIN 36                  //ADC pin for lipo current measurement
+int zeroCurrent = 0;                //ADC value on the hall sensor when current is null
+#define FILTER_SAMPLES 5000         // 1 = no filtering (faster single acquisition but noise on the hall sensor),
 #define REJECT_RATIO 40             //points to reject % left and right before averaging (if filter sample >1)
 float smoothArray[FILTER_SAMPLES];  // array for holding raw sensor values for current sensor
 
@@ -82,11 +99,11 @@ float CurrentRawWeight = 0;
 
 
 //speed sensor
-#define TAC_PIN 27  //IR sensor acting as tachometer
-int tops = 0;       //nb tops when propeller rotates
-long hallTimeout;   //to debounce
-int speedSensorMeasuringTime; //to compute RPM
-#define NB_BLADES 2 // 2 tops for a normal 2 blades propeller
+#define TAC_PIN 27             //IR sensor acting as tachometer
+int tops = 0;                  //nb tops when propeller rotates
+long hallTimeout;              //to debounce
+int speedSensorMeasuringTime;  //to compute RPM
+#define NB_BLADES 2            // 2 tops for a normal 2 blades propeller
 
 
 #define LED_PIN 22
@@ -139,9 +156,10 @@ boolean hasWifiCredentials = false;
 #define PREFERENCES_DEBUG
 //#define DEBUG_TELNET
 //#define RAW_WEIGHT_DEBUG
+//#define DEBUG_TEMPERATURE
 //#define DEBUG_W
-//#define DEBUG_VIN
-//#define DEBUG_CURRENT
+//#define DEBUG_VIN     //debug voltage measurement, useful to calibrate
+//#define DEBUG_CURRENT //debug current measurement, useful to calibrate
 //#define DEBUG_RPM
 
 //UDP --------------
@@ -157,11 +175,11 @@ long LastUDPnotification;
 //end UDP-----------
 
 #ifdef HAS_SPEED_SENSOR
-void IRAM_ATTR hall_ISR()  //hall sensor interrupt routine
+void IRAM_ATTR hall_ISR()  //hall sensor interrupt routine (will only count tops)
 {
   //if ((millis() - hallTimeout) > 10) //leave commented : no need to debounce
   {
-    hallTimeout = millis();
+    //hallTimeout = millis();
     tops++;
     //Serial.println( tops);  //MUST comment this line to avoid crashes
   }
@@ -176,7 +194,7 @@ void setup() {
   // init Rx channels
   pwm_reader_init(pins, numberOfChannels);
   pwm_set_channel_pulse_neutral(0, 1000);  // throttle neutral is set to "zero"
-  pwm_set_channel_pulse_neutral(1, 1000);  //vol neutral is set to "zero"
+
 
   // here you can change channel defaults values before reading (if needed)
   // e.g. pwm_set_channel_pulse_min() /max/neutral
@@ -197,7 +215,17 @@ void setup() {
     Serial.println(" ");
   }
 
-
+  // ESC PWM
+  // Allow allocation of all timers
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  myESC.setPeriodHertz(50);           // standard 50 hz servo
+  myESC.attach(ESC_PIN, 1000, 2000);  // attaches the ESC on pin 33 to the servo object
+                                      // using default min/max of 1000us and 2000us
+                                      // for an accurate 0 to 180 sweep
+  myESC.write(0);                     //be sure the motor is stopped (servo at 0 "angle value")
 
   //Preferences
   preferences.begin("RC_motor_tester", false);
@@ -214,9 +242,6 @@ void setup() {
 #ifdef PREFERENCES_DEBUG
   Serial.println("_________________");
   Serial.println("read preferences :");
-
-  Serial.print("calib0 HX711 : ");
-  Serial.println(calibZero);
   Serial.print("calib HX711 : ");
   Serial.println(calib);
   Serial.print("calib weight (g) : ");
@@ -233,9 +258,7 @@ void setup() {
 #endif
 
   if (ftouchRead(T3) < threshold) touch3detected = true;  //detect touchpad for CONFIG_PIN
-
   //  //connect to WiFi
-
   //WiFiManager
   //Local intialization. Once its business is done, there is no need to keep it around
   WiFiManager wifiManager;
@@ -255,7 +278,7 @@ void setup() {
   {
     //fetches ssid and pass and tries to connect
     //if it does not connect it starts an access point with the specified name
-    //here  "JP RCMotorTesterP"
+    //here  "JP RCMotorTester"
     //and goes into a blocking loop awaiting configuration
     if (!wifiManager.startConfigPortal("JP RCMotorTester")) {
       Serial.println("failed to connect and hit timeout");
@@ -278,9 +301,6 @@ void setup() {
     delay(5000);
   }
 
-
-
-
   //connect to WiFi
   WiFi.begin(ssid.c_str(), password.c_str());
   long start = millis();
@@ -297,8 +317,7 @@ void setup() {
   Serial.println(hasWifiCredentials);
 
 
-
-  //if (hasWifiCredentials)
+  //if (hasWifiCredentials) //don't block the prog if no wifi...it could work with only OLED display
   {
     TelnetStream.begin();  //used to debug over telnet
     Serial.print("IP address: ");
@@ -309,7 +328,7 @@ void setup() {
   }
 
   Serial.println(" ");
-  Serial.println("start decoding : \n");
+  Serial.println("start decoding and monitoring sensors : \n");
 
 
   //delay(3000);
@@ -369,7 +388,7 @@ void setup() {
   for (int i = 0; i < FILTER_SAMPLES; i++) {
     smoothArray[i] = analogRead(CUR_PIN);  //ADC smoothing the zeroCurrent delivered by the sensor (should be 2.5V)
   }
-  zeroCurrent = medianFilter(); // we will filter the samples to keep the non noisy ones to compute zeroCurrent of the hall sensor
+  zeroCurrent = medianFilter();  // we will filter the samples to keep the non noisy ones to compute zeroCurrent of the hall sensor
   prevCurrent = 0;
 #ifdef DEBUG_CURRENT
   Serial.print("zero Current ");
@@ -404,7 +423,7 @@ void loop() {
     temperature += tempScale1.getTempCByIndex(0);
   }
   temperature /= i;
-#ifdef DEBUG
+#ifdef DEBUG_TEMPERATURE
   Serial.print("temperature = ");
   Serial.print(temperature);
   Serial.println(" °C");
@@ -420,7 +439,7 @@ void loop() {
   Serial.print(" / ");
 #endif
   Vin = volts(Vin);
-  if (Vin > prevVin) Vin = prevVin;
+  if (Vin > prevVin) Vin = prevVin;  //will discard positive spikes
 #ifdef DEBUG_VIN
   Serial.println(Vin);
 #endif
@@ -436,7 +455,7 @@ void loop() {
   Serial.print(" / ");
 #endif
   current = amps(current);
-  if ((current) < 0) current = prevCurrent; // this will discard negative current values (spikes due to the ESC...)
+  if ((current) < 0) current = prevCurrent;  // this will discard negative current values (spikes due to the ESC...)
   prevCurrent = current;
 #ifdef DEBUG_CURRENT
   Serial.println(current);
@@ -455,12 +474,12 @@ void loop() {
 
 //propeller RPM
 #ifdef HAS_SPEED_SENSOR
-  RPM = tops * 60*1000 / (millis() - speedSensorMeasuringTime)/NB_BLADES; // simple formula to go from blades tops to RPM
+  RPM = tops * 60 * 1000 / (millis() - speedSensorMeasuringTime) / NB_BLADES;  // simple formula to go from blades tops to RPM
 #ifdef DEBUG_RPM
   Serial.print("RPM = ");
   Serial.println(RPM);
 #endif
-  tops = 0;                             // reset the ISR variable
+  tops = 0;  // reset the ISR variable
   speedSensorMeasuringTime = millis();
 #endif
 
@@ -472,10 +491,47 @@ void loop() {
     // Reading the actual pulse width of Throttle channel
     throttle = constrain((pwm_get_rawPwm(0) - 1000), 0, 1000);  //clip throttle value between 0 and 5
   }
+  /*
+int minThrottle = 0;
+int maxThrottle = 500;
+int currentThrottle = 0;
+int sweepDuration = 5000;  //5s duration for half an automatic mode
+int refreshDelay;
+float refreshStep;
+long refreshTimeOut = 0;*/
 
   // Do something with the pulse width... throttle
-
-
+  // ESC PWM
+  switch (opMode) {
+    case 0:                                      //manual
+      myESC.writeMicroseconds(throttle + 1000);  //replicate the throttle value
+      break;
+    case 1:  //step
+      if ((millis() - refreshTimeOut) > refreshDelay) {
+        refreshTimeOut = millis();
+        currentThrottle += refreshStep;
+        refreshStep = -refreshStep;
+      }
+      throttle = currentThrottle;
+      myESC.writeMicroseconds(throttle + 1000);  //generate the step
+      break;
+    case 2:  //sweep
+      if ((millis() - refreshTimeOut) > refreshDelay) {
+        refreshTimeOut = millis();
+        currentThrottle += refreshStep;
+        if (currentThrottle >= maxThrottle) refreshStep = -refreshStep;
+        if (currentThrottle <= minThrottle) refreshStep = -refreshStep;
+      }
+      throttle = currentThrottle;
+      myESC.writeMicroseconds(throttle + 1000);  //generate the step
+      break;
+    case 3:                               //stop
+      myESC.writeMicroseconds(0 + 1000);  //clear the throttle value
+      break;
+    default:
+      // statements
+      break;
+  }
 
   //************
   // UDP process
@@ -510,6 +566,7 @@ void loop() {
     if (test == "ID")  // send a reply, to the IP address and port that sent us the packet we received
     {
       AndroidConnected = 1;
+      timeOut = millis();
       Res = device;
       sendUDP(Res);
 
@@ -548,6 +605,12 @@ void loop() {
 #ifdef OLED
   displayLCD();  //and update OLED display
 #endif
+
+  if (((millis() - timeOut) > 5000) && (AndroidConnected == 1)) {
+    opMode = 0;  //if connection with Android is lost then switch to manual mode
+    AndroidConnected = 0;
+    Serial.println("lost connection with Android phone, switch to Manual mode");
+  }
 }  //end of Loop
 
 
@@ -618,15 +681,54 @@ void readCmd(String test) {
 
         preferences.putLong("calib", calib);
         preferences.putInt("calibWeight", calibWeight);
-      } else if (Cmd == "CalibCurrent")  //not implemented! Calibration done during each boot time in setup
-      {
+      } else if (Cmd == "Mode") {
 
-        Serial.print("calibration current... ");
-        Serial.println(calib);
+        Serial.print("change operation mode to ");
+        String value = doc["value"];
+        opMode = value.toInt();
+        String minThr = doc["min"];
+        minThrottle = minThr.toInt();
+        String maxThr = doc["max"];
+        maxThrottle = maxThr.toInt();
+        Serial.print(opMode);
+        Serial.print(" min ");
+        Serial.print(minThrottle);
+        Serial.print(" max ");
+        Serial.println(maxThrottle);
+
+        switch (opMode) {
+          case 0:  //manual
+            //do nothing
+            break;
+          case 1:  //step
+            refreshStep = maxThrottle - minThrottle;
+            refreshDelay = sweepDuration;
+            currentThrottle = minThrottle;
+            refreshTimeOut = millis();
+            break;
+          case 2:  //sweep
+            
+            refreshDelay = 50;    //will refresh every 50ms
+            refreshStep = (float)(maxThrottle - minThrottle)*refreshDelay/sweepDuration +0.5;
+            currentThrottle = minThrottle;
+            refreshTimeOut = millis();
+            
+        Serial.print(" refreshStep ");
+        Serial.println(refreshStep);
+        
+            break;
+          case 3:                               //stop
+            myESC.writeMicroseconds(0 + 1000);  //clear the throttle value
+            break;
+          default:
+            // statements
+            break;
+        }
       }
     }
   }
 }
+
 
 #ifdef HAS_HX711
 void GetRawWeight(void) {
